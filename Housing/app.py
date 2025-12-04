@@ -1,235 +1,270 @@
 import streamlit as st
-import pandas as pd
+import joblib
 import numpy as np
-from sklearn.preprocessing import StandardScaler
-from sklearn.linear_model import Lasso
-import plotly.graph_objects as go
+import pandas as pd
 import plotly.express as px
+import plotly.graph_objects as go
+from pathlib import Path
 
-st.set_page_config(page_title="Estimateur Immobilier", layout="wide")
+# Chargement des artefacts du modèle (déjà présent)
+artefacts = joblib.load('./modele_housing.pkl')
+theta = artefacts.get("modele_poids", artefacts.get("theta", None))
+mean_x = artefacts.get("x_mean", None)
+std_x = artefacts.get("x_std", None)
+scaler_y = artefacts.get("y_scaler", None)
 
-# --- Chargement et prétraitement (caché pour réactivité) ---
-@st.cache_data
-def load_and_prepare(path: str):
+# Chemin du dataset (même dossier ou chemin relatif)
+DATA_PATH = Path(__file__).parent / "Housing.csv"
+
+# --- Fonctions utilitaires --------------------------------------------------
+def load_dataset(path):
+    """Charge le dataset Housing.csv et normalise les noms de colonnes."""
     df = pd.read_csv(path)
+    # uniformiser noms colonnes
+    df.columns = [c.strip() for c in df.columns]
+    return df
 
-    # Mapping yes/no -> 1/0
-    yes_no_map = {"yes": 1, "no": 0}
-    cols_yes_no = [
-        "mainroad", "guestroom", "basement", "hotwaterheating",
-        "airconditioning", "prefarea"
-    ]
-    df[cols_yes_no] = df[cols_yes_no].replace(yes_no_map)
+def detect_price_column(df):
+    """Trouve la colonne prix dans le dataset."""
+    for candidate in ["price", "Price", "PRICE", "SalePrice"]:
+        if candidate in df.columns:
+            return candidate
+    # fallback: la colonne numérique avec la plus grande variance
+    num = df.select_dtypes(include=[np.number])
+    if "price" in num.columns:
+        return "price"
+    if not num.empty:
+        return num.var().idxmax()
+    raise RuntimeError("Impossible de détecter la colonne prix dans le dataset.")
 
-    # Mapping furnishingstatus
-    furn_map = {"furnished": 2, "semi-furnished": 1, "unfurnished": 0}
-    df["furnishingstatus"] = df["furnishingstatus"].replace(furn_map)
+def prepare_input_df(df):
+    """Prépare une table d'exemples de caractéristiques (applique get_dummies sur catégorielles).
+       Retourne df_preproc et la liste ordonnée de colonnes d'entrée utilisées pour le modèle."""
+    X = df.copy()
+    price_col = detect_price_column(df)
+    if price_col in X.columns:
+        X = X.drop(columns=[price_col])
+    # Colonnes booléennes encodées 'yes'/'no'
+    for col in X.select_dtypes(include=['object']).columns:
+        vals = X[col].dropna().unique()
+        if set(map(str.lower, vals)) <= {"yes", "no", "y", "n"}:
+            X[col] = X[col].astype(str).str.lower().map(lambda v: 1 if v in ("yes","y") else 0)
+    # One-hot pour categoric non-binaires
+    X = pd.get_dummies(X, drop_first=False)
+    return X
 
-    # Features order (même que le notebook)
-    feature_cols = [
-        "area", "bedrooms", "bathrooms", "stories",
-        "mainroad", "guestroom", "basement", "hotwaterheating",
-        "airconditioning", "parking", "prefarea", "furnishingstatus"
-    ]
+def build_feature_vector(user_inputs, template_columns):
+    """Construit un vecteur de caractéristiques aligné sur template_columns.
+       user_inputs: dict col->value (après encodage si besoin)
+    """
+    x = pd.DataFrame([user_inputs])
+    x = pd.get_dummies(x, drop_first=False)
+    # aligner colonnes
+    for col in template_columns:
+        if col not in x.columns:
+            x[col] = 0
+    # Supprimer colonnes inattendues
+    extra = [c for c in x.columns if c not in template_columns]
+    if extra:
+        x = x.drop(columns=extra)
+    x = x[template_columns]
+    return x.values.flatten()
 
-    X = df[feature_cols].values
-    y = df[["price"]].values  # 2D pour scaler y
+def apply_scaling_and_predict(x_raw):
+    """Applique centrage/normalisation avec mean_x/std_x puis prédit et remet à l'échelle y.
+       Retourne un scalaire float propre.
+    """
+    if mean_x is None or std_x is None or theta is None:
+        st.error("Les artefacts du modèle sont incomplets. Vérifiez le fichier 'modele_housing.pkl'.")
+        return None
 
-    return df, feature_cols, X, y
+    # convertir en numpy 1D
+    x_raw = np.asarray(x_raw, dtype=float).ravel()
 
-df, FEATURE_COLS, X_all, y_all = load_and_prepare("./Housing.csv")
+    # gérer theta/intercept
+    theta_arr = np.asarray(theta, dtype=float).ravel()
+    if theta_arr.size == x_raw.size + 1:
+        intercept = float(theta_arr[0])
+        weights = theta_arr[1:]
+    elif theta_arr.size == x_raw.size:
+        intercept = 0.0
+        weights = theta_arr
+    else:
+        # tenter d'adapter en tronquant ou en complétant avec zéros
+        if theta_arr.size > x_raw.size:
+            intercept = float(theta_arr[0])
+            weights = theta_arr[1:1 + x_raw.size]
+        else:
+            intercept = 0.0
+            weights = np.pad(theta_arr, (0, x_raw.size - theta_arr.size), 'constant')
 
-# --- Entraînement du modèle Lasso sur l'ensemble des données (au lancement) ---
-@st.cache_resource
-def train_model(X, y, alpha=0.1):
-    # Standardisation des features et de la target
-    scaler_X = StandardScaler()
-    scaler_y = StandardScaler()
+    # standardiser avec mean_x/std_x (aligner tailles si nécessaire)
+    mean_x_arr = np.asarray(mean_x, dtype=float).ravel()
+    std_x_arr = np.asarray(std_x, dtype=float).ravel()
 
-    X_scaled = scaler_X.fit_transform(X)
-    y_scaled = scaler_y.fit_transform(y).ravel()  # Lasso attend 1D target
+    if mean_x_arr.size > x_raw.size:
+        mean_x_arr = mean_x_arr[:x_raw.size]
+        std_x_arr = std_x_arr[:x_raw.size]
+    elif mean_x_arr.size < x_raw.size:
+        mean_x_arr = np.pad(mean_x_arr, (0, x_raw.size - mean_x_arr.size), 'constant')
+        std_x_arr = np.pad(std_x_arr, (0, x_raw.size - std_x_arr.size), 'constant') + 1.0
 
-    # Entraînement Lasso (alpha paramétrable)
-    model = Lasso(alpha=alpha, max_iter=10000)
-    model.fit(X_scaled, y_scaled)
+    std_x_arr[std_x_arr == 0] = 1.0
+    x_scaled = (x_raw - mean_x_arr) / std_x_arr
 
-    return model, scaler_X, scaler_y
+    y_scaled = float(intercept + np.dot(x_scaled, weights))
 
-model, scaler_X, scaler_y = train_model(X_all, y_all, alpha=0.1)
+    # remettre y à l'échelle originale si scaler_y fourni
+    y_orig = y_scaled
+    try:
+        if hasattr(scaler_y, "inverse_transform"):
+            # sklearn scalers attend (n_samples, n_features)
+            inv = scaler_y.inverse_transform(np.atleast_2d(y_scaled).T)
+            # inv peut être (1,1) ou (1,) -> extraire premier élément
+            y_orig = np.asarray(inv).ravel()[0]
+        elif isinstance(scaler_y, dict):
+            mean_y = scaler_y.get("mean_", scaler_y.get("y_mean", 0.0))
+            scale_y = scaler_y.get("scale_", scaler_y.get("y_scale", 1.0))
+            y_orig = y_scaled * scale_y + mean_y
+        else:
+            y_orig = float(y_scaled)
+    except Exception:
+        # si inverse_transform échoue, fallback sur valeur non transformée
+        y_orig = float(y_scaled)
 
-# --- Sidebar : Estimateur instantané ---
-st.sidebar.header("Estimateur instantané — Entrées utilisateur")
+    # garantir un scalaire Python float
+    y_arr = np.asarray(y_orig)
+    if y_arr.size == 0:
+        return None
+    return float(y_arr.ravel()[0])
 
-# fonctions utilitaires pour valeurs par défaut
-def num_default(col):
-    return float(df[col].median())
+# --- Interface utilisateur --------------------------------------------------
+st.set_page_config(page_title="Estimateur Immobilier", layout="wide")
+st.title("Estimateur Immobilier — Instantané & Analyse du Marché")
 
-def int_default(col):
-    return int(df[col].median())
+# Charger dataset
+try:
+    df = load_dataset(DATA_PATH)
+except Exception as e:
+    st.error(f"Impossible de charger '{DATA_PATH.name}': {e}")
+    st.stop()
 
-# Numeric inputs
-area = st.sidebar.number_input(
-    "Surface (area)",
-    min_value=int(df["area"].min()),
-    max_value=int(df["area"].max()),
-    value=int_default("area"),
-    step=100
-)
+price_col = detect_price_column(df)
+prices = df[price_col].dropna().astype(float)
 
-bedrooms = st.sidebar.slider(
-    "Bedrooms",
-    int(df["bedrooms"].min()),
-    int(df["bedrooms"].max()),
-    int_default("bedrooms")
-)
+# Préparer colonnes d'entrée modèle à partir du dataset
+X_template = prepare_input_df(df)
+template_cols = list(X_template.columns)
 
-bathrooms = st.sidebar.slider(
-    "Bathrooms",
-    int(df["bathrooms"].min()),
-    int(df["bathrooms"].max()),
-    int_default("bathrooms")
-)
+# Sidebar: inputs utilisateur (valeurs par défaut calculées depuis le dataset)
+with st.sidebar:
+    st.header("Estimateur Instantané")
+    st.caption("Saisissez les caractéristiques de la maison")
 
-stories = st.sidebar.slider(
-    "Stories",
-    int(df["stories"].min()),
-    int(df["stories"].max()),
-    int_default("stories")
-)
+    # Détecter colonnes numériques utilisables pour l'UI (exclure colonnes de dummies)
+    numeric_cols = df.select_dtypes(include=[np.number]).columns.tolist()
+    if price_col in numeric_cols:
+        numeric_cols.remove(price_col)
 
-parking = st.sidebar.slider(
-    "Parking",
-    int(df["parking"].min()),
-    int(df["parking"].max()),
-    int_default("parking")
-)
+    # Prioritaires pour l'affichage: common features
+    prefer = ["area", "Area", "sqft", "total_sqft", "bedrooms", "Beds", "bathrooms", "baths", "stories", "parking"]
+    shown = []
+    user_inputs = {}
 
-# Binary checkboxes (defaults based on median)
-def checkbox_default(col):
-    return bool(df[col].median() >= 0.5)
+    # Pour chaque préférence, si présente dans df, afficher un number_input
+    for p in prefer:
+        if p in df.columns and p not in shown:
+            col = df[p].dropna()
+            default = float(col.median()) if not col.empty else 0.0
+            step = max(0.1, float(col.std())/10) if not col.empty else 1.0
+            user_val = st.number_input(label=p, value=float(default), step=step, format="%.2f")
+            user_inputs[p] = user_val
+            shown.append(p)
 
-mainroad = st.sidebar.checkbox("Main road", value=checkbox_default("mainroad"))
-guestroom = st.sidebar.checkbox("Guest room", value=checkbox_default("guestroom"))
-basement = st.sidebar.checkbox("Basement", value=checkbox_default("basement"))
-hotwaterheating = st.sidebar.checkbox("Hot water heating", value=checkbox_default("hotwaterheating"))
-airconditioning = st.sidebar.checkbox("Air conditioning", value=checkbox_default("airconditioning"))
-prefarea = st.sidebar.checkbox("Preferred area", value=checkbox_default("prefarea"))
+    # Afficher autres numériques restants de façon compacte
+    for col in numeric_cols:
+        if col in shown:
+            continue
+        colseries = df[col].dropna()
+        default = float(colseries.median()) if not colseries.empty else 0.0
+        user_val = st.number_input(label=col, value=float(default), step=1.0)
+        user_inputs[col] = user_val
+        shown.append(col)
 
-# Furnishing status selectbox (user-friendly labels)
-furn_labels = ["unfurnished", "semi-furnished", "furnished"]
-# default based on median encoded value
-furn_default_encoded = int(df["furnishingstatus"].median())
-furn_default_label = furn_labels[furn_default_encoded]
-furnishingstatus_label = st.sidebar.selectbox(
-    "Furnishing status",
-    options=furn_labels,
-    index=furn_labels.index(furn_default_label)
-)
+    # Colonnes catégorielles/object -> selectbox avec valeurs (ou checkbox si binaire string)
+    for col in df.select_dtypes(include=['object']).columns:
+        vals = df[col].dropna().unique()
+        vals_clean = [str(v).strip() for v in vals]
+        if set(map(str.lower, vals_clean)) <= {"yes", "no", "y", "n"}:
+            # checkbox binaire
+            default_checked = (pd.Series(vals_clean).mode().iloc[0].lower() in ("yes", "y"))
+            user_bool = st.checkbox(col, value=default_checked)
+            user_inputs[col] = 1 if user_bool else 0
+        else:
+            # selectbox
+            default = pd.Series(vals_clean).mode().iloc[0] if len(vals_clean) > 0 else ""
+            choice = st.selectbox(col, options=vals_clean, index=0 if default == vals_clean[0] else 0)
+            user_inputs[col] = choice
 
-# mapping label -> encoded
-furn_map_label_to_code = {"unfurnished": 0, "semi-furnished": 1, "furnished": 2}
-furnishingstatus = furn_map_label_to_code[furnishingstatus_label]
+    st.markdown("---")
+    predict_button = st.button("Estimer le prix")
 
-# Bouton prédire (optionnel)
-if st.sidebar.button("Estimer le prix"):
-    pass  # trigger rerun; prediction en continu ci-dessous
+# Construire vecteur aligné avec colonnes template
+x_vector = build_feature_vector(user_inputs, template_cols)
 
-# --- Préparation des features pour prédiction ---
-x_user = np.array([[
-    area, bedrooms, bathrooms, stories,
-    1 if mainroad else 0,
-    1 if guestroom else 0,
-    1 if basement else 0,
-    1 if hotwaterheating else 0,
-    1 if airconditioning else 0,
-    parking,
-    1 if prefarea else 0,
-    furnishingstatus
-]])
+# Si clic sur Estimer ou afficher estimation immédiate
+if predict_button:
+    prix_estime = apply_scaling_and_predict(x_vector)
+    if prix_estime is None:
+        st.stop()
 
-# Normaliser et prédire
-x_user_scaled = scaler_X.transform(x_user)
-y_user_scaled_pred = model.predict(x_user_scaled)  # 1D
-y_user_pred = scaler_y.inverse_transform(y_user_scaled_pred.reshape(-1, 1)).ravel()[0]
+    # Affichage principal
+    col1, col2 = st.columns([1, 2])
+    with col1:
+        st.metric(label="Prix estimé", value=f"{prix_estime:,.0f} {''}")
+        st.write("Caractéristiques saisies :")
+        st.json(user_inputs)
 
-# --- Zone principale : résultats et visualisations ---
-st.title("Estimateur Immobilier — Analyse instantanée et position sur le marché")
-
-# Affichage du prix estimé
-st.metric(label="Prix estimé", value=f"${y_user_pred:,.0f}")
-
-# Jauge (plotly) : position du prix estimé par rapport à min/moy/max
-price_min = float(df["price"].min())
-price_mean = float(df["price"].mean())
-price_max = float(df["price"].max())
-
-gauge = go.Figure(go.Indicator(
-    mode="gauge+number",
-    value=y_user_pred,
-    number={'prefix': '$', 'valueformat': ',.0f'},
-    title={'text': "Position du prix estimé vs marché"},
-    gauge={
-        'axis': {'range': [price_min, price_max]},
-        'steps': [
-            {'range': [price_min, price_mean], 'color': "lightgreen"},
-            {'range': [price_mean, price_max], 'color': "lightcoral"}
-        ],
-        'threshold': {
-            'line': {'color': "red", 'width': 4},
-            'thickness': 0.75,
-            'value': price_mean
+    # Visualisation 1 : Jauge indiquant position du prix estimé par rapport au marché
+    min_p, mean_p, max_p = float(prices.min()), float(prices.mean()), float(prices.max())
+    gauge = go.Figure(go.Indicator(
+        mode="gauge+number+delta",
+        value=prix_estime,
+        domain={'x': [0, 1], 'y': [0, 1]},
+        title={'text': "Position sur le marché"},
+        delta={'reference': mean_p, 'valueformat':".0f"},
+        gauge={
+            'axis': {'range': [min_p, max_p]},
+            'steps': [
+                {'range': [min_p, mean_p], 'color': "lightgray"},
+                {'range': [mean_p, max_p], 'color': "lightblue"}
+            ],
+            'threshold': {
+                'line': {'color': "red", 'width': 4},
+                'thickness': 0.75,
+                'value': prix_estime}
         }
-    }
-))
-gauge.update_layout(height=300, margin=dict(l=20, r=20, t=50, b=20))
+    ))
+    with col2:
+        st.plotly_chart(gauge, use_container_width=True)
 
-# Scatter plot Area vs Price + point utilisateur
-scatter = px.scatter(
-    df,
-    x="area",
-    y="price",
-    labels={"area": "Area", "price": "Price"},
-    title="Area vs Price — Position de la maison simulée",
-    opacity=0.6,
-    height=500
-)
+    # Visualisation 2 : Scatter Area vs Price avec point utilisateur
+    area_candidates = [c for c in df.columns if c.lower() in ("area", "total_sqft", "sqft", "area_sqft")]
+    if area_candidates:
+        area_col = area_candidates[0]
+        fig = px.scatter(df, x=area_col, y=price_col, labels={area_col: "Area", price_col: "Price"},
+                         title="Area vs Price — Position du bien simulé")
+        # extraire area valeur entrée si existante sinon utiliser moyenne
+        area_val = user_inputs.get(area_col, df[area_col].median() if area_col in df.columns else df[area_col].median())
+        fig.add_scatter(x=[area_val], y=[prix_estime], mode='markers', marker=dict(color='red', size=14, symbol='x'),
+                        name='Mon bien')
+        st.plotly_chart(fig, use_container_width=True)
+    else:
+        st.info("Le dataset ne contient pas de colonne 'area' reconnue pour tracer le scatter Area vs Price.")
 
-# Ajouter point utilisateur (rouge, bien visible)
-scatter.add_trace(go.Scatter(
-    x=[area],
-    y=[y_user_pred],
-    mode="markers",
-    marker=dict(color="red", size=14, symbol="x"),
-    name="Maison simulée"
-))
+    # Statistiques rapides du marché
+    st.subheader("Résumé du marché")
+    st.write(f"Min: {min_p:,.0f} — Moyenne: {mean_p:,.0f} — Max: {max_p:,.0f}")
+else:
+    st.info("Entrez les caractéristiques dans la barre latérale et cliquez sur 'Estimer le prix' pour lancer la prédiction.")
 
-scatter.update_layout(margin=dict(l=20, r=20, t=50, b=20))
-
-# Disposition : jauge à gauche, scatter à droite
-col1, col2 = st.columns([1, 2])
-with col1:
-    st.plotly_chart(gauge, use_container_width=True)
-with col2:
-    st.plotly_chart(scatter, use_container_width=True)
-
-# Afficher résumé des features entrées
-with st.expander("Voir les caractéristiques saisies"):
-    inputs_df = pd.DataFrame(x_user, columns=FEATURE_COLS)
-    # reconvertir furnishingstatus en label pour lecture
-    inv_furn = {v: k for k, v in furn_map_label_to_code.items()}
-    inputs_df["furnishingstatus"] = inputs_df["furnishingstatus"].map(inv_furn)
-    st.write(inputs_df.T)
-
-# Petit résumé de performance / info du modèle (optionnel)
-with st.expander("Infos modèle"):
-    st.write("Modèle : Lasso (alpha=0.1) entraîné sur l'ensemble des données.")
-    # montrer coefficients (non transformés) — interprétation limitée à cause du scaling
-    coefs = model.coef_
-    coef_df = pd.DataFrame({
-        "feature": FEATURE_COLS,
-        "coef (scaled space)": coefs
-    })
-    st.dataframe(coef_df)
-
-# Footer minimal
-st.caption("Application créée pour estimer le prix d'une maison et visualiser sa position sur le marché. Données chargées depuis Housing.csv.")

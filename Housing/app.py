@@ -4,267 +4,284 @@ import numpy as np
 import pandas as pd
 import plotly.express as px
 import plotly.graph_objects as go
-from pathlib import Path
 
-# Chargement des artefacts du modèle (déjà présent)
-artefacts = joblib.load('./modele_housing.pkl')
-theta = artefacts.get("modele_poids", artefacts.get("theta", None))
-mean_x = artefacts.get("x_mean", None)
-std_x = artefacts.get("x_std", None)
-scaler_y = artefacts.get("y_scaler", None)
+# Configuration de la page
+st.set_page_config(page_title="House Predict Pro", layout="wide")
 
-# Chemin du dataset (même dossier ou chemin relatif)
-DATA_PATH = Path(__file__).parent / "Housing.csv"
-
-# --- Fonctions utilitaires --------------------------------------------------
-def load_dataset(path):
-    """Charge le dataset Housing.csv et normalise les noms de colonnes."""
-    df = pd.read_csv(path)
-    # uniformiser noms colonnes
-    df.columns = [c.strip() for c in df.columns]
-    return df
-
-def detect_price_column(df):
-    """Trouve la colonne prix dans le dataset."""
-    for candidate in ["price", "Price", "PRICE", "SalePrice"]:
-        if candidate in df.columns:
-            return candidate
-    # fallback: la colonne numérique avec la plus grande variance
-    num = df.select_dtypes(include=[np.number])
-    if "price" in num.columns:
-        return "price"
-    if not num.empty:
-        return num.var().idxmax()
-    raise RuntimeError("Impossible de détecter la colonne prix dans le dataset.")
-
-def prepare_input_df(df):
-    """Prépare une table d'exemples de caractéristiques (applique get_dummies sur catégorielles).
-       Retourne df_preproc et la liste ordonnée de colonnes d'entrée utilisées pour le modèle."""
-    X = df.copy()
-    price_col = detect_price_column(df)
-    if price_col in X.columns:
-        X = X.drop(columns=[price_col])
-    # Colonnes booléennes encodées 'yes'/'no'
-    for col in X.select_dtypes(include=['object']).columns:
-        vals = X[col].dropna().unique()
-        if set(map(str.lower, vals)) <= {"yes", "no", "y", "n"}:
-            X[col] = X[col].astype(str).str.lower().map(lambda v: 1 if v in ("yes","y") else 0)
-    # One-hot pour categoric non-binaires
-    X = pd.get_dummies(X, drop_first=False)
-    return X
-
-def build_feature_vector(user_inputs, template_columns):
-    """Construit un vecteur de caractéristiques aligné sur template_columns.
-       user_inputs: dict col->value (après encodage si besoin)
-    """
-    x = pd.DataFrame([user_inputs])
-    x = pd.get_dummies(x, drop_first=False)
-    # aligner colonnes
-    for col in template_columns:
-        if col not in x.columns:
-            x[col] = 0
-    # Supprimer colonnes inattendues
-    extra = [c for c in x.columns if c not in template_columns]
-    if extra:
-        x = x.drop(columns=extra)
-    x = x[template_columns]
-    return x.values.flatten()
-
-def apply_scaling_and_predict(x_raw):
-    """Applique centrage/normalisation avec mean_x/std_x puis prédit et remet à l'échelle y.
-       Retourne un scalaire float propre.
-    """
-    if mean_x is None or std_x is None or theta is None:
-        st.error("Les artefacts du modèle sont incomplets. Vérifiez le fichier 'modele_housing.pkl'.")
-        return None
-
-    # convertir en numpy 1D
-    x_raw = np.asarray(x_raw, dtype=float).ravel()
-
-    # gérer theta/intercept
-    theta_arr = np.asarray(theta, dtype=float).ravel()
-    if theta_arr.size == x_raw.size + 1:
-        intercept = float(theta_arr[0])
-        weights = theta_arr[1:]
-    elif theta_arr.size == x_raw.size:
-        intercept = 0.0
-        weights = theta_arr
-    else:
-        # tenter d'adapter en tronquant ou en complétant avec zéros
-        if theta_arr.size > x_raw.size:
-            intercept = float(theta_arr[0])
-            weights = theta_arr[1:1 + x_raw.size]
-        else:
-            intercept = 0.0
-            weights = np.pad(theta_arr, (0, x_raw.size - theta_arr.size), 'constant')
-
-    # standardiser avec mean_x/std_x (aligner tailles si nécessaire)
-    mean_x_arr = np.asarray(mean_x, dtype=float).ravel()
-    std_x_arr = np.asarray(std_x, dtype=float).ravel()
-
-    if mean_x_arr.size > x_raw.size:
-        mean_x_arr = mean_x_arr[:x_raw.size]
-        std_x_arr = std_x_arr[:x_raw.size]
-    elif mean_x_arr.size < x_raw.size:
-        mean_x_arr = np.pad(mean_x_arr, (0, x_raw.size - mean_x_arr.size), 'constant')
-        std_x_arr = np.pad(std_x_arr, (0, x_raw.size - std_x_arr.size), 'constant') + 1.0
-
-    std_x_arr[std_x_arr == 0] = 1.0
-    x_scaled = (x_raw - mean_x_arr) / std_x_arr
-
-    y_scaled = float(intercept + np.dot(x_scaled, weights))
-
-    # remettre y à l'échelle originale si scaler_y fourni
-    y_orig = y_scaled
+# --- 1. CHARGEMENT DES ARTEFACTS & DATA ---
+@st.cache_resource
+def load_data():
     try:
-        if hasattr(scaler_y, "inverse_transform"):
-            # sklearn scalers attend (n_samples, n_features)
-            inv = scaler_y.inverse_transform(np.atleast_2d(y_scaled).T)
-            # inv peut être (1,1) ou (1,) -> extraire premier élément
-            y_orig = np.asarray(inv).ravel()[0]
-        elif isinstance(scaler_y, dict):
-            mean_y = scaler_y.get("mean_", scaler_y.get("y_mean", 0.0))
-            scale_y = scaler_y.get("scale_", scaler_y.get("y_scale", 1.0))
-            y_orig = y_scaled * scale_y + mean_y
-        else:
-            y_orig = float(y_scaled)
-    except Exception:
-        # si inverse_transform échoue, fallback sur valeur non transformée
-        y_orig = float(y_scaled)
+        artefacts = joblib.load('modele_housing.pkl')
+        df_raw = pd.read_csv('Housing.csv')
+        return artefacts, df_raw
+    except FileNotFoundError as e:
+        return None, None
 
-    # garantir un scalaire Python float
-    y_arr = np.asarray(y_orig)
-    if y_arr.size == 0:
-        return None
-    return float(y_arr.ravel()[0])
+artefacts, df_raw = load_data()
 
-# --- Interface utilisateur --------------------------------------------------
-st.set_page_config(page_title="Estimateur Immobilier", layout="wide")
-st.title("Estimateur Immobilier — Instantané & Analyse du Marché")
-
-# Charger dataset
-try:
-    df = load_dataset(DATA_PATH)
-except Exception as e:
-    st.error(f"Impossible de charger '{DATA_PATH.name}': {e}")
+if artefacts is None or df_raw is None:
+    st.error("Erreur critique : Fichiers manquants ('modele_housing.pkl' ou 'Housing.csv').")
     st.stop()
 
-price_col = detect_price_column(df)
-prices = df[price_col].dropna().astype(float)
+# Extraction des paramètres du modèle
+theta = artefacts.get("modele_poids", artefacts.get("theta"))
+mean_x = artefacts.get("x_mean")
+std_x = artefacts.get("x_std")
+scaler_y = artefacts.get("y_scaler")
 
-# Préparer colonnes d'entrée modèle à partir du dataset
-X_template = prepare_input_df(df)
-template_cols = list(X_template.columns)
 
-# Sidebar: inputs utilisateur (valeurs par défaut calculées depuis le dataset)
-with st.sidebar:
-    st.header("Estimateur Instantané")
-    st.caption("Saisissez les caractéristiques de la maison")
+# --- 2. FONCTIONS MÉTIER ---
 
-    # Détecter colonnes numériques utilisables pour l'UI (exclure colonnes de dummies)
-    numeric_cols = df.select_dtypes(include=[np.number]).columns.tolist()
-    if price_col in numeric_cols:
-        numeric_cols.remove(price_col)
-
-    # Prioritaires pour l'affichage: common features
-    prefer = ["area", "Area", "sqft", "total_sqft", "bedrooms", "Beds", "bathrooms", "baths", "stories", "parking"]
-    shown = []
-    user_inputs = {}
-
-    # Pour chaque préférence, si présente dans df, afficher un number_input
-    for p in prefer:
-        if p in df.columns and p not in shown:
-            col = df[p].dropna()
-            default = float(col.median()) if not col.empty else 0.0
-            step = max(0.1, float(col.std())/10) if not col.empty else 1.0
-            user_val = st.number_input(label=p, value=float(default), step=step, format="%.2f")
-            user_inputs[p] = user_val
-            shown.append(p)
-
-    # Afficher autres numériques restants de façon compacte
-    for col in numeric_cols:
-        if col in shown:
-            continue
-        colseries = df[col].dropna()
-        default = float(colseries.median()) if not colseries.empty else 0.0
-        user_val = st.number_input(label=col, value=float(default), step=1.0)
-        user_inputs[col] = user_val
-        shown.append(col)
-
-    # Colonnes catégorielles/object -> selectbox avec valeurs (ou checkbox si binaire string)
-    for col in df.select_dtypes(include=['object']).columns:
-        vals = df[col].dropna().unique()
-        vals_clean = [str(v).strip() for v in vals]
-        if set(map(str.lower, vals_clean)) <= {"yes", "no", "y", "n"}:
-            # checkbox binaire
-            default_checked = (pd.Series(vals_clean).mode().iloc[0].lower() in ("yes", "y"))
-            user_bool = st.checkbox(col, value=default_checked)
-            user_inputs[col] = 1 if user_bool else 0
-        else:
-            # selectbox
-            default = pd.Series(vals_clean).mode().iloc[0] if len(vals_clean) > 0 else ""
-            choice = st.selectbox(col, options=vals_clean, index=0 if default == vals_clean[0] else 0)
-            user_inputs[col] = choice
-
-    st.markdown("---")
-    predict_button = st.button("Estimer le prix")
-
-# Construire vecteur aligné avec colonnes template
-x_vector = build_feature_vector(user_inputs, template_cols)
-
-# Si clic sur Estimer ou afficher estimation immédiate
-if predict_button:
-    prix_estime = apply_scaling_and_predict(x_vector)
-    if prix_estime is None:
-        st.stop()
-
-    # Affichage principal
-    col1, col2 = st.columns([1, 2])
-    with col1:
-        st.metric(label="Prix estimé", value=f"{prix_estime:,.0f} {''}")
-        st.write("Caractéristiques saisies :")
-        st.json(user_inputs)
-
-    # Visualisation 1 : Jauge indiquant position du prix estimé par rapport au marché
-    min_p, mean_p, max_p = float(prices.min()), float(prices.mean()), float(prices.max())
-    gauge = go.Figure(go.Indicator(
-        mode="gauge+number+delta",
-        value=prix_estime,
-        domain={'x': [0, 1], 'y': [0, 1]},
-        title={'text': "Position sur le marché"},
-        delta={'reference': mean_p, 'valueformat':".0f"},
-        gauge={
-            'axis': {'range': [min_p, max_p]},
-            'steps': [
-                {'range': [min_p, mean_p], 'color': "lightgray"},
-                {'range': [mean_p, max_p], 'color': "lightblue"}
-            ],
-            'threshold': {
-                'line': {'color': "red", 'width': 4},
-                'thickness': 0.75,
-                'value': prix_estime}
-        }
-    ))
-    with col2:
-        st.plotly_chart(gauge, use_container_width=True)
-
-    # Visualisation 2 : Scatter Area vs Price avec point utilisateur
-    area_candidates = [c for c in df.columns if c.lower() in ("area", "total_sqft", "sqft", "area_sqft")]
-    if area_candidates:
-        area_col = area_candidates[0]
-        fig = px.scatter(df, x=area_col, y=price_col, labels={area_col: "Area", price_col: "Price"},
-                         title="Area vs Price — Position du bien simulé")
-        # extraire area valeur entrée si existante sinon utiliser moyenne
-        area_val = user_inputs.get(area_col, df[area_col].median() if area_col in df.columns else df[area_col].median())
-        fig.add_scatter(x=[area_val], y=[prix_estime], mode='markers', marker=dict(color='red', size=14, symbol='x'),
-                        name='Mon bien')
-        st.plotly_chart(fig, use_container_width=True)
+def predict_price_manual(features_brutes):
+    """Calcule le prix selon les poids de la descente de gradient."""
+    x_input = np.array(features_brutes)
+    x_normalized = (x_input - mean_x) / std_x
+    x_with_bias = np.insert(x_normalized, 0, 1.0)
+    prediction_norm = x_with_bias @ theta
+    
+    # Reshape pour scaler inverse
+    if isinstance(prediction_norm, np.ndarray):
+        val_to_reshape = prediction_norm.reshape(-1, 1)
     else:
-        st.info("Le dataset ne contient pas de colonne 'area' reconnue pour tracer le scatter Area vs Price.")
+        val_to_reshape = np.array([[prediction_norm]])
+        
+    price_dollar = scaler_y.inverse_transform(val_to_reshape)
+    return max(0, price_dollar[0][0]) # Pas de prix négatif
 
-    # Statistiques rapides du marché
-    st.subheader("Résumé du marché")
-    st.write(f"Min: {min_p:,.0f} — Moyenne: {mean_p:,.0f} — Max: {max_p:,.0f}")
-else:
-    st.info("Entrez les caractéristiques dans la barre latérale et cliquez sur 'Estimer le prix' pour lancer la prédiction.")
+def get_similar_houses(user_features, df, top_n=5):
+    """Trouve les maisons les plus proches dans le dataset (Nearest Neighbors basique)."""
+    # 1. Convertir le DF en numérique pour le calcul de distance
+    df_num = df.copy()
+    binary_cols = ['mainroad', 'guestroom', 'basement', 'hotwaterheating', 'airconditioning', 'prefarea']
+    for col in binary_cols:
+        df_num[col] = df_num[col].apply(lambda x: 1 if x == 'yes' else 0)
+    
+    furn_map = {"furnished": 2, "semi-furnished": 1, "unfurnished": 0}
+    df_num['furnishingstatus'] = df_num['furnishingstatus'].map(furn_map)
+    
+    # Colonnes features dans l'ordre exact du modèle (sans le prix)
+    feature_cols = ["area", "bedrooms", "bathrooms", "stories", "mainroad", "guestroom", 
+                    "basement", "hotwaterheating", "airconditioning", "parking", "prefarea", "furnishingstatus"]
+    
+    # 2. Calculer la distance Euclidienne pondérée
+    X_data = df_num[feature_cols].values
+    X_user = np.array(user_features)
+    
+    # Distance euclidienne standardisée
+    dist = np.linalg.norm((X_data - mean_x) / std_x - (X_user - mean_x) / std_x, axis=1)
+    
+    df_res = df.iloc[np.argsort(dist)[:top_n]].copy()
+    df_res['similarity_score'] = dist[np.argsort(dist)[:top_n]]
+    return df_res
 
+
+# --- 3. INTERFACE UTILISATEUR (SIDEBAR) ---
+st.sidebar.title("House Predict Pro")
+st.sidebar.markdown("---")
+
+def get_user_input():
+    st.sidebar.header("Caractéristiques")
+    
+    # Layout compact
+    c1, c2 = st.sidebar.columns(2)
+    area = c1.number_input("Surface (sqft)", 1000, 16000, 4000, 100)
+    stories = c2.selectbox("Étages", [1, 2, 3, 4], index=1)
+    
+    c3, c4 = st.sidebar.columns(2)
+    bedrooms = c3.selectbox("Chambres", [1, 2, 3, 4, 5, 6], index=2)
+    bathrooms = c4.selectbox("Salles de Bain", [1, 2, 3, 4], index=0)
+    
+    parking = st.sidebar.slider("Parking", 0, 3, 1)
+
+    st.sidebar.header("Standing")
+    furnishing_options = {"Meublé": 2, "Semi-meublé": 1, "Non meublé": 0}
+    furn_label = st.sidebar.radio("Ameublement", list(furnishing_options.keys()), horizontal=True)
+    furnishing_val = furnishing_options[furn_label]
+
+    st.sidebar.header("Options")
+    # Utilisation d'expander pour ne pas encombrer
+    with st.sidebar.expander("Détails techniques", expanded=True):
+        mainroad = 1 if st.checkbox("Route Principale", True) else 0
+        prefarea = 1 if st.checkbox("Quartier Prisé", False) else 0
+        aircon = 1 if st.checkbox("Climatisation", True) else 0
+        guestroom = 1 if st.checkbox("Chambre d'amis", False) else 0
+        basement = 1 if st.checkbox("Sous-sol", False) else 0
+        hotwater = 1 if st.checkbox("Chauffe-eau", False) else 0
+
+    features = [area, bedrooms, bathrooms, stories, mainroad, guestroom, basement,
+                hotwater, aircon, parking, prefarea, furnishing_val]
+    
+    return features, {
+        "area": area, "bedrooms": bedrooms, "bathrooms": bathrooms, "stories": stories,
+        "mainroad": mainroad, "guestroom": guestroom, "basement": basement,
+        "hotwater": hotwater, "aircon": aircon, "parking": parking,
+        "prefarea": prefarea, "furnishing_val": furnishing_val
+    }
+
+user_features_list, user_inputs_dict = get_user_input()
+
+# --- 4. DASHBOARD CENTRAL ---
+
+# Calculs
+predicted_price = predict_price_manual(user_features_list)
+price_per_sqft = predicted_price / user_inputs_dict['area']
+
+# --- HEADER : RÉSULTAT CLÉ EN MAIN ---
+col_main, col_gauge = st.columns([2, 1])
+
+with col_main:
+    st.subheader("Estimation de Valeur")
+    st.markdown(f"<h1 style='font-size: 60px; color: #4CAF50;'>${predicted_price:,.0f}</h1>", unsafe_allow_html=True)
+    st.caption(f"Soit environ **${price_per_sqft:.2f}/sqft** pour ce bien de {user_inputs_dict['area']} sqft.")
+    
+    # Export des données (CSV)
+    export_df = pd.DataFrame([user_inputs_dict])
+    export_df['Estimated_Price'] = predicted_price
+    csv = export_df.to_csv(index=False).encode('utf-8')
+    
+    st.download_button(
+        label="Télécharger le rapport CSV",
+        data=csv,
+        file_name='estimation_immobiliere.csv',
+        mime='text/csv',
+    )
+
+with col_gauge:
+    # Jauge simplifiée et efficace
+    min_p, max_p = df_raw['price'].min(), df_raw['price'].max()
+    fig_gauge = go.Figure(go.Indicator(
+        mode = "gauge+number", value = predicted_price,
+        domain = {'x': [0, 1], 'y': [0, 1]},
+        gauge = {'axis': {'range': [min_p, max_p]}, 'bar': {'color': "#4CAF50"}}
+    ))
+    fig_gauge.update_layout(height=150, margin=dict(l=20, r=20, t=20, b=20))
+    st.plotly_chart(fig_gauge, use_container_width=True)
+
+st.markdown("---")
+
+# --- ONGLETS FONCTIONNELS ---
+tab1, tab2, tab3, tab4 = st.tabs(["Investissement", "Plus-Value", "Comparables", "Analyse Avancée"])
+
+# === ONGLET 1 : INVESTISSEMENT LOCATIF (REMPLACE FINANCEMENT) ===
+with tab1:
+    st.subheader("Analyse de Rentabilité Locative")
+    st.markdown("Estimation des revenus potentiels pour un investisseur.")
+    
+    col_inv1, col_inv2 = st.columns(2)
+    with col_inv1:
+        target_yield = st.slider("Rendement Brut Cible (%)", 2.0, 12.0, 6.0, 0.5)
+        occupancy = st.slider("Taux d'occupation annuel (%)", 50, 100, 95)
+        maintenance_cost = st.number_input("Entretien annuel estimé ($)", value=int(predicted_price * 0.01), step=100)
+    
+    with col_inv2:
+        # Calculs de rendement
+        annual_gross_rent = predicted_price * (target_yield / 100)
+        monthly_rent_target = annual_gross_rent / 12
+        
+        # Revenu net estimé (Loyer brut - Vacance - Entretien)
+        effective_annual_income = (annual_gross_rent * (occupancy / 100)) - maintenance_cost
+        
+        st.metric("Loyer Mensuel Conseillé", f"${monthly_rent_target:,.0f}", delta="Cible")
+        st.metric("Cashflow Net Annuel Estimé", f"${effective_annual_income:,.0f}", 
+                 delta=f"{effective_annual_income/predicted_price*100:.1f}% Net Yield")
+        
+        st.caption(f"*Basé sur une vacance de {100-occupancy}% et des coûts d'entretien de ${maintenance_cost}.")
+        if effective_annual_income > 0:
+            st.success("Ce bien présente un potentiel de cashflow positif.")
+        else:
+            st.warning("Attention : Les coûts risquent de dépasser les revenus locatifs.")
+
+# === ONGLET 2 : SIMULATEUR ROI ===
+with tab2:
+    st.subheader("Potentiel de Rénovation")
+    
+    scenarios = []
+    
+    # 1. Ajout Clim
+    if user_inputs_dict['aircon'] == 0:
+        feats_ac = user_features_list.copy()
+        feats_ac[8] = 1 
+        price_ac = predict_price_manual(feats_ac)
+        scenarios.append({"Action": "Installer la Climatisation", "Gain": price_ac - predicted_price})
+        
+    # 2. Rénovation Meubles
+    if user_inputs_dict['furnishing_val'] < 2:
+        feats_fur = user_features_list.copy()
+        feats_fur[11] = 2 
+        price_fur = predict_price_manual(feats_fur)
+        scenarios.append({"Action": "Vendre entièrement meublé", "Gain": price_fur - predicted_price})
+        
+    # 3. Ajout SDB
+    feats_bath = user_features_list.copy()
+    feats_bath[2] += 1
+    price_bath = predict_price_manual(feats_bath)
+    scenarios.append({"Action": "Ajouter 1 Salle de Bain", "Gain": price_bath - predicted_price})
+
+    # 4. Ajout Chambre
+    feats_bed = user_features_list.copy()
+    feats_bed[1] += 1
+    price_bed = predict_price_manual(feats_bed)
+    scenarios.append({"Action": "Créer une chambre supplémentaire", "Gain": price_bed - predicted_price})
+
+    if not scenarios:
+        st.info("Ce bien est déjà très optimisé !")
+    else:
+        max_gain = max([s['Gain'] for s in scenarios]) if scenarios else 1.0
+        if max_gain == 0: max_gain = 1.0
+        
+        cols_sim = st.columns(len(scenarios))
+        for i, scen in enumerate(scenarios):
+            with cols_sim[i]:
+                st.metric(label=scen["Action"], value=f"+ ${scen['Gain']:,.0f}", delta="Plus-value")
+                st.progress(min(1.0, scen['Gain'] / (max_gain * 1.2)))
+
+# === ONGLET 3 : COMPARABLES ===
+with tab3:
+    st.subheader("Biens Similaires Vendus")
+    similar_df = get_similar_houses(user_features_list, df_raw)
+    st.dataframe(
+        similar_df[['price', 'area', 'bedrooms', 'bathrooms', 'airconditioning', 'furnishingstatus']],
+        column_config={
+            "price": st.column_config.NumberColumn("Prix", format="$%d"),
+            "area": st.column_config.NumberColumn("Surface", format="%d sqft"),
+            "airconditioning": "Clim",
+            "furnishingstatus": "État"
+        },
+        use_container_width=True,
+        hide_index=True
+    )
+    
+    avg_sim_price = similar_df['price'].mean()
+    st.info(f"Prix moyen des comparables : ${avg_sim_price:,.0f}")
+
+# === ONGLET 4 : ANALYSE AVANCÉE (NOUVEAU) ===
+with tab4:
+    col_a1, col_a2 = st.columns(2)
+    
+    with col_a1:
+        st.subheader("Sensibilité Prix / Surface")
+        st.caption("Comment évolue le prix de VOTRE configuration si la surface change ?")
+        
+        # Génération courbe de sensibilité
+        areas_to_test = np.linspace(1500, 12000, 50)
+        prices_sensitivity = []
+        
+        base_features = list(user_features_list)
+        for a in areas_to_test:
+            temp_feats = base_features.copy()
+            temp_feats[0] = a # Index 0 est area
+            prices_sensitivity.append(predict_price_manual(temp_feats))
+            
+        fig_sens = px.line(x=areas_to_test, y=prices_sensitivity, labels={'x': 'Surface (sqft)', 'y': 'Prix Estimé ($)'})
+        # Marquer la position actuelle
+        fig_sens.add_trace(go.Scatter(x=[user_inputs_dict['area']], y=[predicted_price], mode='markers', marker=dict(color='red', size=10), name="Actuel"))
+        st.plotly_chart(fig_sens, use_container_width=True)
+
+    with col_a2:
+        st.subheader("Impact des Variables (Poids)")
+        weights = theta[1:].flatten()
+        features_labels = ["Surface", "Chambres", "SDB", "Étages", "Route", "Amis", "Sous-sol", "Eau Ch.", "Clim", "Parking", "Quartier", "Meubles"]
+        
+        fig_bar = px.bar(x=weights, y=features_labels, orientation='h', title="Importance relative dans le modèle")
+        st.plotly_chart(fig_bar, use_container_width=True)

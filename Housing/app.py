@@ -4,6 +4,7 @@ import numpy as np
 import pandas as pd
 import plotly.express as px
 import plotly.graph_objects as go
+from fpdf import FPDF  # Nécessite pip install fpdf
 
 # Configuration de la page
 st.set_page_config(page_title="House Predict Pro", layout="wide")
@@ -50,8 +51,7 @@ def predict_price_manual(features_brutes):
     return max(0, price_dollar[0][0]) # Pas de prix négatif
 
 def get_similar_houses(user_features, df, top_n=5):
-    """Trouve les maisons les plus proches dans le dataset (Nearest Neighbors basique)."""
-    # 1. Convertir le DF en numérique pour le calcul de distance
+    """Trouve les maisons les plus proches dans le dataset."""
     df_num = df.copy()
     binary_cols = ['mainroad', 'guestroom', 'basement', 'hotwaterheating', 'airconditioning', 'prefarea']
     for col in binary_cols:
@@ -60,20 +60,51 @@ def get_similar_houses(user_features, df, top_n=5):
     furn_map = {"furnished": 2, "semi-furnished": 1, "unfurnished": 0}
     df_num['furnishingstatus'] = df_num['furnishingstatus'].map(furn_map)
     
-    # Colonnes features dans l'ordre exact du modèle (sans le prix)
     feature_cols = ["area", "bedrooms", "bathrooms", "stories", "mainroad", "guestroom", 
                     "basement", "hotwaterheating", "airconditioning", "parking", "prefarea", "furnishingstatus"]
     
-    # 2. Calculer la distance Euclidienne pondérée
     X_data = df_num[feature_cols].values
     X_user = np.array(user_features)
     
-    # Distance euclidienne standardisée
     dist = np.linalg.norm((X_data - mean_x) / std_x - (X_user - mean_x) / std_x, axis=1)
     
     df_res = df.iloc[np.argsort(dist)[:top_n]].copy()
     df_res['similarity_score'] = dist[np.argsort(dist)[:top_n]]
     return df_res
+
+def create_pdf_report(user_inputs, price, price_sqft):
+    """Génère un rapport PDF simple."""
+    pdf = FPDF()
+    pdf.add_page()
+    
+    # Titre
+    pdf.set_font("Arial", 'B', 16)
+    pdf.cell(0, 10, "Rapport d'Estimation Immobiliere", ln=True, align='C')
+    pdf.ln(10)
+    
+    # Prix
+    pdf.set_font("Arial", 'B', 14)
+    pdf.cell(0, 10, f"Prix Estime: ${price:,.0f}", ln=True)
+    pdf.set_font("Arial", '', 12)
+    pdf.cell(0, 10, f"Prix au sqft: ${price_sqft:.2f}/sqft", ln=True)
+    pdf.ln(10)
+    
+    # Caractéristiques
+    pdf.set_font("Arial", 'B', 14)
+    pdf.cell(0, 10, "Details du bien:", ln=True)
+    pdf.set_font("Arial", '', 11)
+    
+    for key, value in user_inputs.items():
+        # Nettoyage basique pour compatibilité latin-1
+        clean_key = str(key).replace('_', ' ').title()
+        clean_val = str(value)
+        pdf.cell(0, 8, f"{clean_key}: {clean_val}", ln=True)
+        
+    pdf.ln(10)
+    pdf.set_font("Arial", 'I', 10)
+    pdf.cell(0, 10, "Genere par House Predict Pro", ln=True, align='R')
+    
+    return pdf.output(dest='S').encode('latin-1')
 
 
 # --- 3. INTERFACE UTILISATEUR (SIDEBAR) ---
@@ -100,7 +131,6 @@ def get_user_input():
     furnishing_val = furnishing_options[furn_label]
 
     st.sidebar.header("Options")
-    # Utilisation d'expander pour ne pas encombrer
     with st.sidebar.expander("Détails techniques", expanded=True):
         mainroad = 1 if st.checkbox("Route Principale", True) else 0
         prefarea = 1 if st.checkbox("Quartier Prisé", False) else 0
@@ -135,20 +165,42 @@ with col_main:
     st.markdown(f"<h1 style='font-size: 60px; color: #4CAF50;'>${predicted_price:,.0f}</h1>", unsafe_allow_html=True)
     st.caption(f"Soit environ **${price_per_sqft:.2f}/sqft** pour ce bien de {user_inputs_dict['area']} sqft.")
     
-    # Export des données (CSV)
+    # Préparation des fichiers
+    # 1. CSV
     export_df = pd.DataFrame([user_inputs_dict])
     export_df['Estimated_Price'] = predicted_price
-    csv = export_df.to_csv(index=False).encode('utf-8')
+    csv_data = export_df.to_csv(index=False).encode('utf-8')
     
-    st.download_button(
-        label="Télécharger le rapport CSV",
-        data=csv,
-        file_name='estimation_immobiliere.csv',
-        mime='text/csv',
-    )
+    # 2. PDF
+    try:
+        pdf_data = create_pdf_report(user_inputs_dict, predicted_price, price_per_sqft)
+        pdf_available = True
+    except Exception as e:
+        pdf_available = False
+        
+    # Boutons côte à côte
+    btn_col1, btn_col2 = st.columns(2)
+    with btn_col1:
+        st.download_button(
+            label="Télécharger Rapport CSV",
+            data=csv_data,
+            file_name='estimation_immobiliere.csv',
+            mime='text/csv',
+            use_container_width=True
+        )
+    with btn_col2:
+        if pdf_available:
+            st.download_button(
+                label="Télécharger Rapport PDF",
+                data=pdf_data,
+                file_name='estimation_immobiliere.pdf',
+                mime='application/pdf',
+                use_container_width=True
+            )
+        else:
+            st.warning("Installez 'fpdf' pour le PDF")
 
 with col_gauge:
-    # Jauge simplifiée et efficace
     min_p, max_p = df_raw['price'].min(), df_raw['price'].max()
     fig_gauge = go.Figure(go.Indicator(
         mode = "gauge+number", value = predicted_price,
@@ -163,7 +215,7 @@ st.markdown("---")
 # --- ONGLETS FONCTIONNELS ---
 tab1, tab2, tab3, tab4 = st.tabs(["Investissement", "Plus-Value", "Comparables", "Analyse Avancée"])
 
-# === ONGLET 1 : INVESTISSEMENT LOCATIF (REMPLACE FINANCEMENT) ===
+# === ONGLET 1 : INVESTISSEMENT LOCATIF ===
 with tab1:
     st.subheader("Analyse de Rentabilité Locative")
     st.markdown("Estimation des revenus potentiels pour un investisseur.")
@@ -175,11 +227,8 @@ with tab1:
         maintenance_cost = st.number_input("Entretien annuel estimé ($)", value=int(predicted_price * 0.01), step=100)
     
     with col_inv2:
-        # Calculs de rendement
         annual_gross_rent = predicted_price * (target_yield / 100)
         monthly_rent_target = annual_gross_rent / 12
-        
-        # Revenu net estimé (Loyer brut - Vacance - Entretien)
         effective_annual_income = (annual_gross_rent * (occupancy / 100)) - maintenance_cost
         
         st.metric("Loyer Mensuel Conseillé", f"${monthly_rent_target:,.0f}", delta="Cible")
@@ -195,30 +244,25 @@ with tab1:
 # === ONGLET 2 : SIMULATEUR ROI ===
 with tab2:
     st.subheader("Potentiel de Rénovation")
-    
     scenarios = []
     
-    # 1. Ajout Clim
     if user_inputs_dict['aircon'] == 0:
         feats_ac = user_features_list.copy()
         feats_ac[8] = 1 
         price_ac = predict_price_manual(feats_ac)
         scenarios.append({"Action": "Installer la Climatisation", "Gain": price_ac - predicted_price})
         
-    # 2. Rénovation Meubles
     if user_inputs_dict['furnishing_val'] < 2:
         feats_fur = user_features_list.copy()
         feats_fur[11] = 2 
         price_fur = predict_price_manual(feats_fur)
         scenarios.append({"Action": "Vendre entièrement meublé", "Gain": price_fur - predicted_price})
         
-    # 3. Ajout SDB
     feats_bath = user_features_list.copy()
     feats_bath[2] += 1
     price_bath = predict_price_manual(feats_bath)
     scenarios.append({"Action": "Ajouter 1 Salle de Bain", "Gain": price_bath - predicted_price})
 
-    # 4. Ajout Chambre
     feats_bed = user_features_list.copy()
     feats_bed[1] += 1
     price_bed = predict_price_manual(feats_bed)
@@ -251,11 +295,10 @@ with tab3:
         use_container_width=True,
         hide_index=True
     )
-    
     avg_sim_price = similar_df['price'].mean()
     st.info(f"Prix moyen des comparables : ${avg_sim_price:,.0f}")
 
-# === ONGLET 4 : ANALYSE AVANCÉE (NOUVEAU) ===
+# === ONGLET 4 : ANALYSE AVANCÉE ===
 with tab4:
     col_a1, col_a2 = st.columns(2)
     
@@ -263,25 +306,51 @@ with tab4:
         st.subheader("Sensibilité Prix / Surface")
         st.caption("Comment évolue le prix de VOTRE configuration si la surface change ?")
         
-        # Génération courbe de sensibilité
         areas_to_test = np.linspace(1500, 12000, 50)
         prices_sensitivity = []
-        
         base_features = list(user_features_list)
         for a in areas_to_test:
             temp_feats = base_features.copy()
-            temp_feats[0] = a # Index 0 est area
+            temp_feats[0] = a 
             prices_sensitivity.append(predict_price_manual(temp_feats))
             
         fig_sens = px.line(x=areas_to_test, y=prices_sensitivity, labels={'x': 'Surface (sqft)', 'y': 'Prix Estimé ($)'})
-        # Marquer la position actuelle
         fig_sens.add_trace(go.Scatter(x=[user_inputs_dict['area']], y=[predicted_price], mode='markers', marker=dict(color='red', size=10), name="Actuel"))
         st.plotly_chart(fig_sens, use_container_width=True)
 
     with col_a2:
-        st.subheader("Impact des Variables (Poids)")
-        weights = theta[1:].flatten()
-        features_labels = ["Surface", "Chambres", "SDB", "Étages", "Route", "Amis", "Sous-sol", "Eau Ch.", "Clim", "Parking", "Quartier", "Meubles"]
+        # Option 1: Positionnement
+        st.subheader("Positionnement sur le Marché")
+        st.caption("Où se situe votre bien par rapport à l'offre existante ?")
+        fig_dist = px.histogram(df_raw, x="price", nbins=30, color_discrete_sequence=['#cbd5e1'], opacity=0.7, labels={'price': 'Prix ($)'})
+        fig_dist.add_vline(x=predicted_price, line_width=3, line_dash="dash", line_color="#4CAF50", annotation_text="Votre estimation", annotation_position="top right")
+        fig_dist.update_layout(xaxis_title="Prix ($)", yaxis_title="Nombre de biens", showlegend=False, margin=dict(l=20, r=20, t=30, b=20))
+        st.plotly_chart(fig_dist, use_container_width=True)
+        percentile = (df_raw['price'] < predicted_price).mean() * 100
+        st.info(f"Ce bien est plus cher que **{percentile:.0f}%** des maisons du marché.")
+    
+    # Option 2: Radar
+    st.markdown("---")
+    st.subheader("Profil du Bien vs Moyenne (Radar)")
+    categories = ['area', 'bedrooms', 'bathrooms', 'parking', 'stories']
+    user_vals = []
+    avg_vals = []
+    for cat in categories:
+        max_val = df_raw[cat].max()
+        user_vals.append(user_inputs_dict[cat] / max_val)
+        avg_vals.append(df_raw[cat].mean() / max_val)
         
-        fig_bar = px.bar(x=weights, y=features_labels, orientation='h', title="Importance relative dans le modèle")
-        st.plotly_chart(fig_bar, use_container_width=True)
+    fig_radar = go.Figure()
+    fig_radar.add_trace(go.Scatterpolar(r=user_vals, theta=categories, fill='toself', name='Votre Bien', line_color='#4CAF50'))
+    fig_radar.add_trace(go.Scatterpolar(r=avg_vals, theta=categories, fill='toself', name='Moyenne Marché', line_color='#94a3b8', opacity=0.5))
+    fig_radar.update_layout(polar=dict(radialaxis=dict(visible=True, range=[0, 1])), margin=dict(l=40, r=40, t=30, b=30), showlegend=True, height=400)
+    st.plotly_chart(fig_radar, use_container_width=True)
+
+    # Option 3: Scatter Plot
+    st.markdown("---")
+    st.subheader("Ratio Prix / Surface")
+    st.caption("Comparaison avec les transactions réelles.")
+    fig_scat = px.scatter(df_raw, x="area", y="price", color_discrete_sequence=['#cbd5e1'], opacity=0.6, labels={'area': 'Surface (sqft)', 'price': 'Prix ($)'})
+    fig_scat.add_trace(go.Scatter(x=[user_inputs_dict['area']], y=[predicted_price], mode='markers', marker=dict(color='#4CAF50', size=15, symbol='star'), name="Votre Bien"))
+    fig_scat.update_layout(showlegend=False, margin=dict(l=20, r=20, t=30, b=20))
+    st.plotly_chart(fig_scat, use_container_width=True)
